@@ -19,7 +19,7 @@
 
 - ##### JDK8之后的JVM内存布局
 
-![image-20200206132931885](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200206132931885.png)
+![image-20200206132931885](https://github.com/Jerry1ee/-/tree/master/images/image-20200206132931885.png)
 
 - ##### 程序计数器（Program Counter Register）
 
