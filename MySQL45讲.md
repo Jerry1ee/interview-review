@@ -823,3 +823,540 @@ B——————————————读Redis计数———————�
 
 MySQL会给每个线程分配一块sort_buffer内存用于排序
 
+![image-20200214141625642](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214141625642.png)
+
+执行`select city,name,age from t where city='杭州' order by name limit 1000 ;  `的具体流程如下：
+
+-  初始化sort_buffer，确定放入name、 city、 age这三个字段；
+-  从索引city找到第一个满足city='杭州’条件的主键id，也就是图中的ID_X；
+-  到主键id索引取出整行，取name、 city、 age三个字段的值，存入sort_buffer中；
+-  从索引city取下一个记录的主键id；
+-  重复步骤3、 4直到city的值不满足查询条件为止，对应的主键id也就是图中的ID_Y；
+-  对sort_buffer中的数据按照字段name做快速排序；
+-  按照排序结果取前1000行返回给客户端。  
+
+![image-20200214141743700](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214141743700.png)
+
+如果排序需要的数据量小于 `sort_buffer_size`（MySQL为排序开辟的内存），就在内存中完成，如果排序数据量大，内存放不下，就得用临时文件辅助排序
+
+### rowid排序
+
+如果MySQL认为排序单行长度太大（返回字段很多，内存中能同时存放的行数很少）
+
+` SET max_length_for_sort_data = 16;  `如果单行长度超过16，认为单行太大
+
+执行流程变为：
+
+- 初始化sort_buffer，确定放入两个字段，即name和id；
+- 从索引city找到第一个满足city='杭州’条件的主键id，也就是图中的ID_X；
+- 到主键id索引取出整行，取name、 id这两个字段，存入sort_buffer中；
+- 从索引city取下一个记录的主键id；
+- 重复步骤3、 4直到不满足city='杭州’条件为止，也就是图中的ID_Y；
+- 对sort_buffer中的数据按照字段name进行排序；
+- .遍历排序结果，取前1000行，并按照id的值回到原表中取出city、 name和age三个字段返回给客户端。  
+
+### 全字段排序VSrowid排序
+
+如果内存足够大，会优先选择全字段排序，把需要的字段先放到sort_buffer中，排序后直接从内存中返回查询结果，不回原表取数据，如果内存实在不够，才用rowid排序
+
+**内存够，就要多利用内存，尽量减少IO磁盘访问**
+
+可以使用覆盖索引、联合索引优化排序，让数据入库时本身就是排好序的，但这种做法要进行权衡，维护索引是有代价的
+
+## 17.如何正确地显式随机消息
+
+从一个表中随机取出几个行，如何正确地实现？
+
+### 内存临时表
+
+`mysql> select word from words order by rand() limit 3;  `
+
+**使用explain查看语句执行情况**
+
+- Extra字段显示Using temporary，表示的是需要使用临时表
+- Using filesort，表示的是需要执行排序操作
+
+#### 语句流程
+
+- 创建一个临时表。这个临时表使用的是memory引擎，表里有两个字段，第一个字段是double类型，为了后面描述方便，记为字段R，第二个字段是varchar(64)类型，记为字段W。并且，这个表没有建索引  
+- 从words表中，按主键顺序取出所有word值。对每个word值，用rand()函数生成一个0-1之间的小数，把这个小村和word存入临时表地R和W字段中。扫描了10000行
+- 临时表有10000行，在这个无索引的内存临时表上，按字段R排序
+- 从内存临时表中一行行取出R值和位置信息，分别存入sort_buffer两个字段里，又对临时表扫描了一遍，扫描行数累计20000
+- sort_Buffer中按R值排序
+- 排序完毕，取出前3个结果位置信息，依次到内存临时表中取出word值，返回客户端
+
+共扫描了20003行
+
+### MySQL如何定位 一行数据 ？
+
+#### rowid：每个引擎用来唯一标识数据行的信息
+
+- 对于有主键的InnoDB表来说，这个rowid就是主键ID；
+- 对于没有主键的InnoDB表来说，这个rowid就是由系统生成的；
+- MEMORY引擎不是索引组织表。在这个例子里面，你可以认为它就是一个数组。因此，这个rowid其实就是数组的下标  
+
+### 磁盘临时表
+
+`tmp_table_size  `限制了内存临时表的大小，默认16M。如果临时表大小超过这个数值，**内存**临时表就会转成**磁盘**临时表
+
+#### 优先队列算法
+
+- 对待排序的（R，rowid），先取前三行，构造成一个堆
+- 取下一行（R1，rowid1），跟堆中最大的R比较，R1小于R，用这一行代替它
+- 重复第二步，知道全部行都完成比较
+
+#### 用优先队列算法还是临时表的归并排序算法？
+
+取决于`sort_buffer_size`的大小，如果维护的堆过大，比如设置前1000行而不是前3行，那么就只能用归并排序算法
+
+### 随机排序方法
+
+如果仅随机选一个word值，如何做？
+
+- 随机主键ID法
+
+  - 取得主键ID的最大值M和最小值N
+  - 随机函数生成一个MN之间的数X
+  - 取不小于X的第一个ID的行
+
+  效率很高，不用扫描全表。但选择每一行的概率不一样
+
+  因为假如有4个ID，1，2，4，5。此时ID中有空洞，那么选到ID=4的概率就是其他行的两倍
+
+  优化：
+
+  - 取得整个表的行数C
+  - 取Y = floor(C * rand())，floor函数向下取整
+  - 再用limit Y,1取得一行
+
+  解决了概率不均衡问题
+
+- 随机取3个word值
+
+  - 取整个表的行数 记为C
+  - 根据相同随机方法得到 Y1、Y2、Y3
+  - 再执行3个limit Y，1语句得到三行数据
+
+## 18.为什么这些SQL语句逻辑相同，性能却差异巨大
+
+### 案例一：条件字段函数操作
+
+对索引字段做函数操作，可能会破坏索引值的有序性，优化器就决定放弃走树搜索功能
+
+条件` where month(t_modifed)=7;  `尽量改成：
+
+`where
+-> (t_modifed >= '2016-7-1' and t_modifed<'2016-8-1') or
+-> (t_modifed >= '2017-7-1' and t_modifed<'2017-8-1') or
+-> (t_modifed >= '2018-7-1' and t_modifed<'2018-8-1');  `
+
+
+
+### 案例二：隐式类型转换
+
+**在MySQL中，字符串和数字做比较的话，是将字符串转换成数字**
+
+这时候如果将字符串类的索引与数字进行比较，那么就自动将索引转换成数字
+
+`mysql> select * from tradelog where tradeid=110717;  `
+
+由于 `tradeid`是varchar类型，这条语句相当于
+
+`mysql> select * from tradelog where CAST(tradid AS signed int) = 110717;  `
+
+就触发了上面的规则：对索引字段做了函数操作
+
+### 案例三：隐式字符编码转换
+
+也是连接过程中要求在被驱动表的索引字段上加函数操作  
+
+### 对索引字段做函数操作，可能会破坏索引值的有序性，因此优化器就决定放弃走树搜索功能。  
+
+## 19.为什么我只查一行的语句，也执行这么慢
+
+### 第一类：查询长时间不返回
+
+`mysql> select * from t where id=1;`
+
+`show processlist`可以查看语句处于的状态
+
+#### 等MDL锁
+
+查询`sys.schema_table_lock_waits`表，找出造成阻塞的process id，将这个连接用kill命令断开
+
+#### 等flush
+
+有一个flush tables命令被别的语句堵住了，然后它又堵住了我们的select语句
+
+#### 等行锁
+
+查询`sys.innodb_lock_waits `表
+
+`mysql> select * from t sys.innodb_lock_waits where locked_table=`'test'.'t'`\G`
+
+### 第二类：查询慢
+
+`mysql> select * from t where c=50000 limit 1;`
+
+由于c上没有索引，只能走ID主键扫描，要扫描5万行，数据量大起来，执行时间线性增长
+
+
+
+- 当前读和一致性读
+- `mysql> select * from t where id=1；`
+- `select * from t where id=1 lock in share mode;`
+- 带锁语句执行更快
+- 看下面的事务过程
+
+![image-20200214165133148](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214165133148.png)
+
+- 带 lock in share mode 的SQL语句，是当前读，会直接读到 update 100万次后的结果，速度很快
+- 而不带锁的语句，是一致性读，需要从100万次更新后的结果，依次执行undo log，回滚100万次
+
+## 20.幻读是什么，幻读有什么问题
+
+### 幻读是什么？
+
+查看下面的场景
+
+![image-20200214172054176](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214172054176.png)
+
+- Q1返回ID=5的这一行
+- Q2返回ID=5和ID=0的两行
+- Q3返回ID=0，ID=1，ID=5这三行
+- **Q3读到ID=1的这一行，被称为“幻读”**
+
+#### 幻读指的是一个事务在前后两次查询同一个范围的时候，后一次查询看到了前一次查询没有看到的行
+
+#### 注意：
+
+- 普通查询在**可重复读**隔离级别下是快照读，不会看到别的事务插入数据，幻读在“当前读”下才会出现
+- 上面B事务中，修改的结果被A看到，不算幻读。**幻读专指“新插入的行”**
+
+### 幻读的问题
+
+#### 语义上
+
+破坏了行锁声明，刚开始锁住了d=5的这一行(ID=5)，但B事务可以修改ID=0的这一行，修改完后，d=5，这个时候，这一行的修改就破坏了加锁声明
+
+#### 数据一致性问题
+
+如图，A事务中加入了一句`update t set d=100 where d=5`
+
+![image-20200214173151579](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214173151579.png)
+
+但写入binlog时，事务A最终提交是在T6时刻，所以就会造成把B和C事务修改和插入的行一起给改变
+
+#### 引入原因
+
+只给d=5这一行加锁导致的
+
+- 解决：给所有行都加上锁
+- 问题：如果后来插入的那行还不存在，那就根本谈不上给它加锁
+
+所以，即使把所有记录都加上锁，还是阻止不了新插入的数据
+
+### 如何解决幻读？
+
+#### 间隙锁（Gap Lock）
+
+```mysql
+CREATE TABLE `t` (
+`id` int(11) NOT NULL,
+`c` int(11) DEFAULT NULL,
+`d` int(11) DEFAULT NULL,
+PRIMARY KEY (`id`),
+KEY `c` (`c`)
+) ENGINE=InnoDB;
+insert into t values(0,0,0),(5,5,5),
+(10,10,10),(15,15,15),(20,20,20),(25,25,25); 
+```
+
+插入六个记录，产生了7个间隙，如下图
+
+![image-20200214173835258](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200214173835258.png)
+
+这时候执行`select * from t where d=5 for update  `时，不光加了6个行锁，还加了7个间隙锁
+
+**跟间隙锁存在冲突关系的，是“往这个间隙中插入一个记录”这个操作  ，间隙锁之间不存在冲突**
+
+**间隙锁和行锁合称next-key lock**  
+
+- 前开后闭区间
+- 使用`select * from t for update`可以将整个表所有记录锁起来，形成了7个前开后闭区间：
+- (-∞,0]、 (0,5]、 (5,10]、 (10,15]、 (15,20]、 (20, 25]、 (25, +suprenum]  
+
+#### 问题：
+
+**间隙锁导致同样的语句会锁住更大的范围，影响并发度**
+
+### 其他方法
+
+把隔离级别改成 读提交 ，同时解决数据和日志不一致问题，把binlog格式设置为row
+
+## 21.为什么我只改一行语句，锁那么多？
+
+### 两个原则，两个优化，一个bug
+
+- 原则1：加锁的基本单位是next-key lock 
+- 原则2：查找过程中访问到的对象才会加锁
+- 优化1：索引上的等值查询，给唯一索引加锁时，next-key lock退化为行锁
+- 优化2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候， next-key lock退化为间隙锁  
+- bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止  
+
+## 22.MySQL有哪些“饮鸩止渴”提高性能的方法
+
+### 短连接风暴
+
+一旦数据库处理的慢一点，这些短连接数量有可能就会暴涨
+
+#### 方案
+
+**处理掉占着连接但不工作的线程**
+
+- max_connections的计算，不是看谁在running，是只要连着就占用一个计数位置  
+
+- 有损失，优先断开事务外空闲的连接
+
+**减少连接过程的消耗**
+
+- 有的业务代码会短时间内先大量申请数据库连接做备用
+- 可以让数据库跳过权限验证阶段：重启数据库，使用`–skip-grant-tables`参数启动  
+- 风险极高，不建议使用
+
+### 慢查询性能问题
+
+原因：
+
+- 索引没有设计好；
+- SQL语句没写好；
+- MySQL选错了索引  
+
+#### 索引没有设计好
+
+- 紧急创建索引
+
+- 备库B上执行 `set sql_log_bin = off`，不写binlog，然后执行alter table语句加上索引
+- 执行主备切换
+- 此时主库为B，备库是A。在A上执行 `set sql_log_bin = off`，然后执行alter table语句加上索引
+
+#### 语句没写好
+
+- query_rewrite  功能，把输入的一种语句改写成另一模式
+
+- 语句被错误地写成了 `select * from t where id + 1 = 10000  `
+
+- 增加语句改写规则
+
+- ```mysql
+  mysql> insert into query_rewrite.rewrite_rules(pattern, replacement, pattern_database) values ("select *
+  from t where id + 1 = ?", "select * from t where id = ? - 1", "db1");
+  call query_rewrite.fush_rewrite_rules();
+  ```
+
+#### 选错了索引
+
+- 应急方案，加上force index
+
+### 上线前的准备工作
+
+- 上线前，在测试环境，把慢查询日志（slow log）打开，并且把long_query_time设置成0，确保每个语句都会被记录入慢查询日志；
+- 在测试表里插入模拟线上的数据，做一遍回归测试；
+- 观察慢查询日志里每类语句的输出，特别留意Rows_examined字段是否与预期一致。
+
+### QPS突增问题
+
+- 白名单去掉
+- 单独数据库用户，将这个用户删掉，断开现有连接
+- 处理语句限制，将所有查询全重写为 `select  1`
+
+## 23.MySQL怎么保证数据不丢的？
+
+### binlog的写入机制
+
+- 先把日志写到binlog cache ，事务提交时，再把binlog cache写到binlog文件中
+- 系统给binlog cache分配了一片内存，每个线程一个，参数binlog_cache_size用于控制单个线程内binlog cache所占内存大小，超过就要暂存到磁盘
+- 注意：每个线程都有自己的binlog cache ，但共用同一份 binlog文件
+
+![image-20200215152356657](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200215152356657.png)
+
+binlog写盘状态如上图
+
+- write，指的是把日志写入到文件系统的page cache，并没有把数据持久化到磁盘，速度较快
+- fsync，指数据持久化到磁盘。一般认为fsync才占磁盘IOPS
+
+**write 和fsync的时机，是由参数sync_binlog控制的：**
+
+- sync_binlog=0的时候，表示每次提交事务都只write，不fsync；
+- sync_binlog=1的时候，表示每次提交事务都会执行fsync；
+- sync_binlog=N(N>1)的时候，表示每次提交事务都write，但累积N个事务后才fsync
+
+出现IO瓶颈时，可以将sync_binlog设置成一个大值提升性能。但主机发生异常重启，会丢失最近N个事务的binlog日志
+
+### redo log 写入机制
+
+事务还没提交时，redo log buffer有可能被持久化到磁盘
+
+![image-20200215152746037](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200215152746037.png)
+
+#### 三种状态
+
+- 存在redo log buffer中，物理上是在MySQL进程内存中，就是图中的红色部分；
+- 写到磁盘(write)，但是没有持久化（fsync)，物理上是在文件系统的page cache里面，也就是图中的黄色部分；
+- 持久化到磁盘，对应的是hard disk，也就是图中的绿色部分。
+
+**为了控制redo log的写入策略，InnoDB提供了`innodb_flush_log_at_trx_commit`参数，它有三种可能取值**
+
+- 设置为0的时候，表示每次事务提交时都只是把redo log留在redo log buffer中;
+- 设置为1的时候，表示每次事务提交时都将redo log直接持久化到磁盘；
+- 设置为2的时候，表示每次事务提交时都只是把redo log写到page cache。
+- InnoDB有一个后台线程，每隔1秒，就会把redo log buffer中的日志，调用write写到文件系统的page cache，然后调用fsync持久化到磁盘。
+
+**注意，事务执行中间过程的redo log也是直接写在redo log buffer中的，这些redo log也会被后台线程一起持久化到磁盘。也就是说，一个没有提交的事务的redo log，也是可能已经持久化到磁盘的。**
+
+除了每秒一次轮询操作，还有两种场景会让一个没有提交的事务redo log写入到磁盘中
+
+- **一种是，redo log buffer占用的空间即将达到 innodb_log_buffer_size一半的时候，后台线程会主动写盘。**注意，由于这个事务并没有提交，所以这个写盘动作只是write，而没有调用fsync，也就是只留在了文件系统的page cache。
+- **另一种是，并行的事务提交的时候，顺带将这个事务的redo log buffer持久化到磁盘。**假设一个事务A执行到一半，已经写了一些redo log到buffer中，这时候有另外一个线程的事务B提交，如果innodb_flush_log_at_trx_commit设置的是1，那么按照这个参数的逻辑，事务B要把redo log buffer里的日志全部持久化到磁盘。这时候，就会带上事务A在redo log buffer里的日志一起持久化到磁盘。
+
+### LSN日志逻辑序列号
+
+每次redo log写入长度为length 的redo log ，LSN值就会加上length
+
+下图是三个并发事务trx1,trx2,trx3在prepare阶段，都写完redo log buffer，持久化到磁盘的过程，对应的LSN是 50 120 160
+
+<img src="C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200215154827333.png" alt="image-20200215154827333" style="zoom: 200%;" />
+
+- trx1第一个到达，被选为leader
+- 开始写盘时，组里已经有了三个事务，LSN变为160
+- 等trx1返回时，所有LSN小于等于160的redo log ，都已经被持久化到磁盘
+- trx2和trx3可以直接返回
+
+一组提交里面，组员越多，节约磁盘IOPS效果越好
+
+#### 拖时间的优化
+
+![image-20200215155324637](C:\Users\lzy\AppData\Roaming\Typora\typora-user-images\image-20200215155324637.png)
+
+### WAL机制好处
+
+- redo log和binlog都是顺序写，磁盘顺序写比随机写速度要快
+- 组提交机制，大幅度江都磁盘的IOPS消耗
+
+### 双一设置
+
+sync_binlog 和innodb_flush_log_at_trx_commit都设置为1
+
+**一个事务完整提交前，需要等待两次刷盘，一次是redo log（prepare 阶段），一次是binlog**，组提交机制可以尽量减少刷盘次数
+
+## 24.MySQL怎么保证主备一致的？
+
+### 主备基本原理
+
+- 为什么把备库设置为只读（readonly）
+  - 运营类查询会被放到备库上查，设置为只读防止误操作
+  - 防止切换逻辑有bug，如切换过程中出现双写，造成主备不一致
+  - 用readonly状态来判断节点的角色
+- 只读如何与主库保持同步更新？
+  - super权限线程无视readonly
+
+### 同步长连接
+
+备库B跟主库A维持一个长连接，主库A有一个线程，专门服务备库B的长连接
+
+事务日志的同步过程：
+
+- 备库B上-change master命令，设置主库A ip 端口 用户名 密码，从哪个位置开始请i去binLog，这个位置包含的文件名和日志偏移量
+- 备库B上执行start slave,备库上启动两个线程 io_thread和sql_thread。io_thread负责与主库建立连接
+- 主库A校验用户名密码后，按照备库B传来的位置，本地读取binlog发给B
+- 备库B拿到binlog后，写道本地文件，称为中转日志（relay log）
+- sql_thread 读取中转日志，解析出日志里的命令，执行
+
+### binlog 的三种格式对比
+
+statement：有可能造成主备库操作的行不一致（比如使用了两个不同索引）
+
+row：记录了真实更改的行的主键ID，不会有主备更新不同行问题
+
+但row格式很占空间，statement记的是操作的一个SQL语句，row格式记录的是操作行的记录，操作了几行就要记几行
+
+mixed：statement和binlog混合使用，MySQL会自己进行判断
+
+### 循环复制问题
+
+主备库的双M结构：两个库互相为对方的备库
+
+- 规定两个库的server id必须不同，若相同就不能为主备关系
+- 更新的事务，binlog中记录的是自己库的server id
+- 再次接收到自己库的server id时，判断相同，就不会处理，死循环中断
+
+## 25.MySQL怎么保证高可用的？
+
+### 主备延迟
+
+与数据同步有关的时间点：
+
+- 主库A执行完一个事务，写入binglog，这个时刻记为T1
+- 传给备库B，把备库B接收完这个binlog的时刻记为T2
+- 备库B执行完这个事务，记为T3
+
+T3-T1就是主备延迟
+
+### 主备延迟来源
+
+- 有可能备库性能比主库差导致
+
+- 备库查询压力太大
+- 处理方法：
+  - 一主多从，多个从库来分担读的压力
+  - 通过binlog输出到外部系统，如Hadoop，让外部系统提供统计类查询的能力
+- 大事务
+  - 时间很长的事务，导致从库延迟
+  - 大表DDL。
+- 备库的并行复制能力
+
+### 可靠性优先策略
+
+- 判断备库B现在的seconds_behind_master，如果小于某个值（比如5秒）继续下一步，否则持续重试这一步；
+- 把主库A改成只读状态，即把readonly设置为true；
+- 判断备库B的seconds_behind_master的值，直到这个值变成0为止；
+- 把备库B改成可读写状态，也就是把readonly 设置为false；
+- 把业务请求切到备库B。
+
+切换期间有不可用时间
+
+### 可用性优先策略
+
+不等主备数据同步，直接切换到库B，也就是把上面可靠性优先策略的4.5步刚开始就执行
+
+会产生数据不一致情况
+
+**建议使用可靠性优先策略**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 一些技巧
+
+`show processlist`可以查看语句处于的状态
+
+`explain+sql语句`查看语句执行的过程
