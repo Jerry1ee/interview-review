@@ -5,6 +5,6 @@
 - https://blog.csdn.net/weixin_43925277/category_9752121.html
 
 # 博客地址
-- MySQL45讲
+- MySQL45讲，趣谈网络协议会搬到CSDN博客上继续写，下面是博客地址
 
 - https://blog.csdn.net/weixin_43925277
