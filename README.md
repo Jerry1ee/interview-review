@@ -8,3 +8,7 @@
 - MySQL45讲，趣谈网络协议会搬到CSDN博客上继续写，下面是博客地址
 
 - https://blog.csdn.net/weixin_43925277
+
+# 复习提纲及春招面经
+
+https://www.nowcoder.com/discuss/391046
